@@ -1,13 +1,10 @@
-import json
-import time
-import random
 import os
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
-from pyspark.sql.types import StructType, StructField, StringType, FloatType, TimestampType
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+from producer import AdapterParam
 
 os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-streaming-kafka-0-10_2.12:3.5.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 pyspark-shell'
 
@@ -59,6 +56,9 @@ if __name__ == "__main__":
         T.StructField("timestamp", T.StringType(), True),
         T.StructField("temperature", T.DoubleType(), True),
         T.StructField("humidity", T.DoubleType(), True),
+        T.StructField("waterQuality", T.DoubleType(), True),
+        T.StructField("insectPresence", T.DoubleType(), True),
+        T.StructField("motion", T.DoubleType(), True),
     ])
 
     parsed_df = (
@@ -71,6 +71,8 @@ if __name__ == "__main__":
     TEMP_THRESHOLD_LOW = 15.0
     HUM_THRESHOLD = 35.0
     HUM_THRESHOLD_HIGH = 75.0
+    WAT_THRESHOLD_LOW = 0.6
+
 
     alerts_df = (
     parsed_df
@@ -78,16 +80,36 @@ if __name__ == "__main__":
          .when(F.col("temperature") < TEMP_THRESHOLD_LOW, F.lit("Low_temperature"))
          .when(F.col("humidity") < HUM_THRESHOLD, F.lit("Low_humidity"))
          .when(F.col("humidity") > HUM_THRESHOLD_HIGH, F.lit("High_humidity"))
+         .when(F.col("waterQuality") < WAT_THRESHOLD_LOW, F.lit("Low_Water_Quality"))
+         .when(F.col("insectPresence") == 1, F.lit("Insect_Detected"))
+         .when(F.col("motion") == 1, F.lit("Motion_Detected"))
       )
-      .where(F.col("alert_type").isNotNull())
+    .withColumn("alert_value", 
+        F.when(F.col("temperature") > TEMP_THRESHOLD, F.col("temperature").cast("string"))
+         .when(F.col("temperature") < TEMP_THRESHOLD_LOW, F.col("temperature").cast("string"))
+         .when(F.col("humidity") < HUM_THRESHOLD, F.col("humidity").cast("string"))
+         .when(F.col("humidity") > HUM_THRESHOLD_HIGH, F.col("humidity").cast("string"))
+         .when(F.col("waterQuality") < WAT_THRESHOLD_LOW, F.col("waterQuality").cast("string"))
+         .when(F.col("insectPresence") == 1, F.col("insectPresence").cast("string"))
+         .when(F.col("motion") == 1, F.col("motion").cast("string"))
     )
+    .where(F.col("alert_type").isNotNull())
+    .select("sensor_id", "timestamp", "alert_type", "alert_value")
+    )
+
+    def process_alert_batch(df, epoch_id):
+        df.persist()
+        df.show(truncate=False) 
+        if df.count() > 0:
+            rows = df.collect()
+            for row in rows:
+                AdapterParam(row["alert_type"], row["sensor_id"])
+        df.unpersist()
 
     query = (
         alerts_df.writeStream
         .outputMode("append")
-        .format("console")
-        .option("truncate", "false")
-        .option("numRows", 50)
+        .foreachBatch(process_alert_batch)
         .start()
     )
 
