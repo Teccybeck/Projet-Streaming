@@ -5,6 +5,9 @@ import os
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
 from pyspark.sql.types import StructType, StructField, StringType, FloatType, TimestampType
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
 os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-streaming-kafka-0-10_2.12:3.5.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 pyspark-shell'
 
@@ -19,69 +22,73 @@ def read_config():
     return config
 
 if __name__ == "__main__":
-    
-    spark = SparkSession\
-            .builder\
-            .appName("TD5")\
-            .getOrCreate()
-
-    sensor_schema = StructType([
-        StructField("sensor_id", StringType(), True),
-        StructField("timestamp", TimestampType(), True),
-        StructField("temperature", FloatType(), True),
-        StructField("humidity", FloatType(), True)
-    ])
 
     config = read_config()
     bootstrap_servers = config.get("bootstrap.servers")
     sasl_username = config.get("sasl.username")
     sasl_password = config.get("sasl.password")
     jaas_config = f'org.apache.kafka.common.security.plain.PlainLoginModule required username=\"{sasl_username}\" password=\"{sasl_password}\";'
-    
-    spark.conf.set("spark.sql.streaming.statefulOperator.checkCorrectness.enabled", "false")
+    topic = 'IOT_sensor'
 
-    kafka_options = {
-        "kafka.bootstrap.servers": bootstrap_servers,
-        "kafka.sasl.mechanism": "PLAIN",
-        "kafka.security.protocol": "SASL_SSL",
-        "kafka.sasl.jaas.config": jaas_config,
-        "startingOffsets": "earliest",
-        "auto.offset.reset": "earliest"
-    }
-
-    sensors_loaded_stream = spark.readStream\
-        .format("kafka")\
-        .option("subscribe", "IOT_sensor")\
-        .options(**kafka_options)\
-        .load()
-    
-    sensors_stream = sensors_loaded_stream.select(
-        F.col("value").cast(StringType()).alias("json_value")
-    ).select(
-        F.from_json(F.col("json_value"), sensor_schema).alias("data")
-    ).select(F.col("data.*"))
-
-    sensors_state = sensors_stream.groupBy("sensor_id").agg(
-        F.max("timestamp").alias("timestamp"),
-        F.last("temperature").alias("temperature"),
-        F.last("humidity").alias("humidity")
+    spark = (
+        SparkSession.builder
+        .appName("IoT_Sensor_Alerts")
+        .getOrCreate()
     )
 
-    sensors_state.createOrReplaceTempView("sensor_table")
+    spark.conf.set("spark.sql.streaming.statefulOperator.checkCorrectness.enabled", "false")
 
-    querry = """
-    SELECT * FROM sensor_table
-    """
+    spark.sparkContext.setLogLevel("WARN")
 
-    query_stream = spark.sql(querry).writeStream\
-        .format("console")\
-        .outputMode("complete")\
-        .queryName("name")\
-        .option("truncate", "false")\
-        .trigger(processingTime="5 seconds")\
+    kafka_df = (
+        spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", bootstrap_servers)
+        .option("subscribe", topic)
+        .option("startingOffsets", "latest")
+        .option("kafka.security.protocol", "SASL_SSL")
+        .option("kafka.sasl.mechanism", "PLAIN")
+        .option("kafka.sasl.jaas.config", jaas_config)
+        .load()
+    )
+
+    value_df = kafka_df.select(F.col("value").cast("string").alias("json_str"))
+
+    schema = T.StructType([
+        T.StructField("sensor_id", T.StringType(), True),
+        T.StructField("timestamp", T.StringType(), True),
+        T.StructField("temperature", T.DoubleType(), True),
+        T.StructField("humidity", T.DoubleType(), True),
+    ])
+
+    parsed_df = (
+        value_df
+        .select(F.from_json("json_str", schema).alias("data"))
+        .select("data.*")
+    )
+
+    TEMP_THRESHOLD = 40.0
+    TEMP_THRESHOLD_LOW = 15.0
+    HUM_THRESHOLD = 35.0
+    HUM_THRESHOLD_HIGH = 75.0
+
+    alerts_df = (
+    parsed_df
+    .withColumn("alert_type", F.when(F.col("temperature") > TEMP_THRESHOLD, F.lit("High_temperature"))
+         .when(F.col("temperature") < TEMP_THRESHOLD_LOW, F.lit("Low_temperature"))
+         .when(F.col("humidity") < HUM_THRESHOLD, F.lit("Low_humidity"))
+         .when(F.col("humidity") > HUM_THRESHOLD_HIGH, F.lit("High_humidity"))
+      )
+      .where(F.col("alert_type").isNotNull())
+    )
+
+    query = (
+        alerts_df.writeStream
+        .outputMode("append")
+        .format("console")
+        .option("truncate", "false")
+        .option("numRows", 50)
         .start()
+    )
 
-    try:
-        query_stream.awaitTermination()
-    except KeyboardInterrupt:
-        print("Arrêt du streaming demandé.")
+    query.awaitTermination()

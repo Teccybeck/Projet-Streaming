@@ -53,3 +53,10 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nArrêt du producer.")
         producer.close()
+
+def AdapterParam(data, val):
+    # A modif
+    if val == "up":
+        return True
+    elif val == "down":
+        return True
