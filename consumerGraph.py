@@ -1,11 +1,13 @@
 import os
 import time
+import json
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
 from pyspark.sql import types as T
+from kafka import KafkaProducer
 
 os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-streaming-kafka-0-10_2.12:3.5.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 pyspark-shell'
 
@@ -27,22 +29,28 @@ if __name__ == "__main__":
     sasl_username = config.get("sasl.username")
     sasl_password = config.get("sasl.password")
     
+    sasl_mechanism = "PLAIN"
+    security_protocol = "SASL_SSL" if sasl_username and sasl_password else "PLAINTEXT"
+    
     jaas_config = None
     if sasl_username and sasl_password:
         jaas_config = f'org.apache.kafka.common.security.plain.PlainLoginModule required username=\"{sasl_username}\" password=\"{sasl_password}\";'
 
-    spark = SparkSession.builder.appName("IoT_Final_Dashboard_MultiAlerts").getOrCreate()
+    INPUT_TOPIC = 'IOT_sensor'
+    OUTPUT_TOPIC = 'IOT_archive'
+
+    spark = SparkSession.builder.appName("IoT_Dashboard_And_Archiver").getOrCreate()
     spark.conf.set("spark.sql.streaming.statefulOperator.checkCorrectness.enabled", "false")
     spark.sparkContext.setLogLevel("WARN")
 
     kafka_options = {
         "kafka.bootstrap.servers": bootstrap_servers,
-        "subscribe": 'IOT_sensor',
+        "subscribe": INPUT_TOPIC,
         "startingOffsets": "latest"
     }
     if jaas_config:
-        kafka_options["kafka.security.protocol"] = "SASL_SSL"
-        kafka_options["kafka.sasl.mechanism"] = "PLAIN"
+        kafka_options["kafka.security.protocol"] = security_protocol
+        kafka_options["kafka.sasl.mechanism"] = sasl_mechanism
         kafka_options["kafka.sasl.jaas.config"] = jaas_config
 
     kafka_df = spark.readStream.format("kafka").options(**kafka_options).load()
@@ -59,7 +67,15 @@ if __name__ == "__main__":
     
     parsed_df = kafka_df.select(F.from_json(F.col("value").cast("string"), schema).alias("data")).select("data.*")
 
-    query = (
+    TEMP_THRESHOLD = 40.0
+    TEMP_THRESHOLD_LOW = 15.0
+    HUM_THRESHOLD = 35.0
+    HUM_THRESHOLD_LOW = 35.0
+    HUM_THRESHOLD_HIGH = 75.0
+    WAT_THRESHOLD_LOW = 0.6
+    VALID_SENSORS = ['sensor_1', 'sensor_2', 'sensor_3', 'sensor_4', 'motion_sensor']
+
+    query_memory = (
         parsed_df.writeStream
         .format("memory")
         .queryName("iot_raw_data")
@@ -67,20 +83,70 @@ if __name__ == "__main__":
         .start()
     )
 
-    TEMP_THRESHOLD = 40.0
-    TEMP_THRESHOLD_LOW = 15.0
-    HUM_THRESHOLD_LOW = 35.0
-    HUM_THRESHOLD_HIGH = 75.0
-    WAT_THRESHOLD_LOW = 0.6
-    
-    VALID_SENSORS = ['sensor_1', 'sensor_2', 'sensor_3', 'sensor_4', 'motion_sensor']
+    enriched_df = (
+        parsed_df
+        .withColumn("alert_type", F.when(F.col("temperature") > TEMP_THRESHOLD, F.lit("High_temperature"))
+             .when(F.col("temperature") < TEMP_THRESHOLD_LOW, F.lit("Low_temperature"))
+             .when(F.col("humidity") < HUM_THRESHOLD_LOW, F.lit("Low_humidity"))
+             .when(F.col("humidity") > HUM_THRESHOLD_HIGH, F.lit("High_humidity"))
+             .when(F.col("waterQuality") < WAT_THRESHOLD_LOW, F.lit("Low_Water_Quality"))
+             .when(F.col("insectPresence") == 1, F.lit("Insect_Detected"))
+             .when(F.col("motion") == 1, F.lit("Motion_Detected"))
+             .otherwise(None)
+          )
+        .withColumn("alert_value", 
+            F.when(F.col("temperature") > TEMP_THRESHOLD, F.col("temperature").cast("string"))
+             .when(F.col("temperature") < TEMP_THRESHOLD_LOW, F.col("temperature").cast("string"))
+             .when(F.col("humidity") < HUM_THRESHOLD_LOW, F.col("humidity").cast("string"))
+             .when(F.col("humidity") > HUM_THRESHOLD_HIGH, F.col("humidity").cast("string"))
+             .when(F.col("waterQuality") < WAT_THRESHOLD_LOW, F.col("waterQuality").cast("string"))
+             .when(F.col("insectPresence") == 1, F.col("insectPresence").cast("string"))
+             .when(F.col("motion") == 1, F.col("motion").cast("string"))
+             .otherwise(None)
+        )
+        .select("sensor_id", "timestamp", "temperature", "humidity", "waterQuality", "insectPresence", "motion", "alert_type", "alert_value")
+    )
+
+    def process_archiving_batch(df, epoch_id):
+        df.persist()
+        count = df.count()
+        if count > 0:
+            print(f"📦 [Archiver] Envoi de {count} données vers '{OUTPUT_TOPIC}'...")
+            rows = df.collect()
+            try:
+                producer = KafkaProducer(
+                    bootstrap_servers=bootstrap_servers,
+                    security_protocol=security_protocol,
+                    sasl_mechanism=sasl_mechanism,
+                    sasl_plain_username=sasl_username,
+                    sasl_plain_password=sasl_password,
+                    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+                )
+                
+                for row in rows:
+                    data_to_send = row.asDict()
+                    producer.send(OUTPUT_TOPIC, data_to_send)
+                
+                producer.flush()
+                producer.close()
+                print("✅ [Archiver] Succès.")
+            except Exception as e:
+                print(f"❌ [Archiver] Erreur : {e}")
+        df.unpersist()
+
+    query_archive = (
+        enriched_df.writeStream
+        .outputMode("append")
+        .foreachBatch(process_archiving_batch)
+        .start()
+    )
 
     plt.ion()
     fig, axs = plt.subplots(2, 3, figsize=(16, 10)) 
     fig.suptitle('IoT Dashboard - Monitoring Temps Réel & Incidents', fontsize=16)
     ax_flat = axs.flatten()
 
-    print("📈 Dashboard (Gestion Alertes Multiples). En attente de données...")
+    print("📈 Dashboard & Archivage lancés. En attente de données...")
 
     try:
         while True:
@@ -118,7 +184,7 @@ if __name__ == "__main__":
                     recent_alerts = recent_alerts_raw.explode('alert_list')
                     recent_alerts['alert_type'] = recent_alerts['alert_list']
 
-                # GRAPHE 1 : TEMPÉRATURE
+                # 1. Température
                 ax1 = ax_flat[0]
                 ax1.clear()
                 if not sensors_only_pdf.empty:
@@ -129,11 +195,10 @@ if __name__ == "__main__":
                     ax1.set_title("Température (°C)")
                     ax1.set_ylim(0, 50)
                     ax1.axhline(TEMP_THRESHOLD, color='r', linestyle='--', alpha=0.5)
-                    ax1.axhline(TEMP_THRESHOLD_LOW, color='r', linestyle='--', alpha=0.5)
                     for bar in bars1:
                         ax1.annotate(f'{bar.get_height()}°', (bar.get_x() + bar.get_width()/2, bar.get_height()), ha='center', va='bottom')
 
-                # GRAPHE 2 : HUMIDITÉ
+                # 2. Humidité
                 ax2 = ax_flat[1]
                 ax2.clear()
                 if not sensors_only_pdf.empty:
@@ -147,7 +212,7 @@ if __name__ == "__main__":
                     for bar in bars2:
                         ax2.annotate(f'{bar.get_height()}%', (bar.get_x() + bar.get_width()/2, bar.get_height()), ha='center', va='bottom')
 
-                # GRAPHE 3 : EAU
+                # 3. Eau
                 ax3 = ax_flat[2]
                 ax3.clear()
                 if not sensors_only_pdf.empty:
@@ -158,7 +223,7 @@ if __name__ == "__main__":
                     ax3.set_ylim(0, 1.2)
                     ax3.axhline(WAT_THRESHOLD_LOW, color='r', linestyle='--', alpha=0.5)
 
-                # GRAPHE 4 : MOUVEMENT
+                # 4. Mouvement
                 ax4 = ax_flat[3]
                 ax4.clear()
                 if not motion_only_pdf.empty:
@@ -174,7 +239,7 @@ if __name__ == "__main__":
                     ax4.set_yticks([])
                     ax4.set_xticks([])
 
-                # GRAPHE 5 : INSECTES
+                # 5. Insectes
                 ax5 = ax_flat[4]
                 ax5.clear()
                 if not sensors_only_pdf.empty:
@@ -187,7 +252,7 @@ if __name__ == "__main__":
                     ax5.set_yticklabels(['Non', 'Oui'])
                     ax5.tick_params(axis='x', rotation=15)
 
-                # GRAPHE 6 : STATISTIQUES ALERTES
+                # 6. Statistiques Alertes
                 ax6 = ax_flat[5]
                 ax6.clear()
                 
@@ -196,7 +261,7 @@ if __name__ == "__main__":
                     recent_alerts['prev_ts'] = recent_alerts.groupby(['sensor_id', 'alert_type'])['timestamp'].shift(1)
                     recent_alerts['time_diff'] = (recent_alerts['timestamp'] - recent_alerts['prev_ts']).dt.total_seconds()
                     
-                    GAP_THRESHOLD = 20 
+                    GAP_THRESHOLD = 60 
                     unique_incidents = recent_alerts[ (recent_alerts['time_diff'].isnull()) | (recent_alerts['time_diff'] > GAP_THRESHOLD) ]
                     
                     if not unique_incidents.empty:
@@ -222,9 +287,6 @@ if __name__ == "__main__":
                      ax6.text(0.5, 0.5, "Aucun incident", ha='center', va='center')
                      ax6.set_title("Incidents (12h)")
 
-            else:
-                print("... En attente de données dans Kafka ...")
-
             plt.tight_layout()
             plt.subplots_adjust(top=0.90, bottom=0.15, hspace=0.4)
             plt.draw()
@@ -233,5 +295,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Arrêt du dashboard.")
     finally:
-        query.stop()
-        print("Spark Stream arrêté.")
+        query_memory.stop()
+        query_archive.stop()
+        print("Spark Streams arrêtés.")
